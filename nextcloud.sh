@@ -26,12 +26,16 @@ done
 
 # Install dependencies
 apt-get update && apt-get upgrade -y
-apt-get install -y software-properties-common curl unzip nfs-common apache2 mariadb-server certbot python3-certbot-apache
+apt-get install -y software-properties-common curl unzip nfs-common apache2 mariadb-server certbot python3-certbot-apache redis-server
 
-# Add PHP 8.2 repo if not already present
+# Add PHP 8.2 repo and install
 add-apt-repository ppa:ondrej/php -y
 apt-get update
-apt-get install -y php8.2 php8.2-{cli,common,imap,redis,snmp,xml,zip,mbstring,curl,gd,mysql}
+apt-get install -y php8.2 php8.2-{cli,common,imap,redis,snmp,xml,zip,mbstring,curl,gd,mysql,apcu,opcache}
+
+# Enable Redis
+systemctl enable redis-server
+systemctl start redis-server
 
 # Secure MariaDB
 mysql_secure_installation <<EOF
@@ -74,10 +78,20 @@ sudo -u www-data php occ maintenance:install \
   --admin-pass "$PASSWORD" \
   --data-dir /mnt/files
 
-# Configure trusted domain and URL
+# Configure config.php
 CONFIG_FILE=/var/www/html/nextcloud/config/config.php
 sed -i "s/'localhost'/'$HOSTNAME'/g" "$CONFIG_FILE"
 sed -i "s|'overwrite.cli.url' => '.*'|'overwrite.cli.url' => 'https://$HOSTNAME'|g" "$CONFIG_FILE"
+
+# Add Redis and caching configuration
+cat <<EOF >> "$CONFIG_FILE"
+  'memcache.local' => '\\OC\\Memcache\\APCu',
+  'memcache.locking' => '\\OC\\Memcache\\Redis',
+  'redis' => [
+    'host' => '127.0.0.1',
+    'port' => 6379,
+  ],
+EOF
 
 # Configure Apache
 cat <<EOF > /etc/apache2/sites-available/nextcloud.conf
@@ -102,8 +116,29 @@ EOF
 a2ensite nextcloud.conf
 a2enmod rewrite headers env dir mime ssl
 
-# Obtain Let's Encrypt certificate
+# Enable OPCache with recommended settings
+cat <<EOF > /etc/php/8.2/apache2/conf.d/10-opcache.ini
+[opcache]
+opcache.enable=1
+opcache.interned_strings_buffer=8
+opcache.max_accelerated_files=10000
+opcache.memory_consumption=128
+opcache.save_comments=1
+opcache.revalidate_freq=1
+EOF
+
+# Enable APCu
+echo "apc.enable_cli=1" > /etc/php/8.2/mods-available/apcu.ini
+
+# Tune PHP (optional: tweak based on RAM)
+sed -i 's/memory_limit = .*/memory_limit = 512M/' /etc/php/8.2/apache2/php.ini
+sed -i 's/upload_max_filesize = .*/upload_max_filesize = 512M/' /etc/php/8.2/apache2/php.ini
+sed -i 's/post_max_size = .*/post_max_size = 512M/' /etc/php/8.2/apache2/php.ini
+sed -i 's/max_execution_time = .*/max_execution_time = 300/' /etc/php/8.2/apache2/php.ini
+
+# Obtain SSL certificate
 certbot --apache --non-interactive --agree-tos --redirect -d "$HOSTNAME" -m "$EMAIL"
 
-# Restart Apache
+# Restart services
 systemctl reload apache2
+systemctl restart redis-server
