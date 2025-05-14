@@ -1,8 +1,9 @@
 #!/bin/bash
 
+set -e
 export DEBIAN_FRONTEND=noninteractive
 
-# defaults 
+# Default variables
 HOSTNAME="localhost"
 USERNAME="admin"
 PASSWORD="password123"
@@ -10,87 +11,99 @@ EMAIL="test@example.com"
 STORAGEACCOUNT=""
 CONTAINER=""
 
-for i in "$@"
-do
-	case $i in
-		--hostname=*)
-		HOSTNAME="${i#*=}" 
-		;;
-		--username=*)
-		USERNAME="${i#*=}"
-		;;
-		--password=*)
-		PASSWORD="${i#*=}"
-		;;
-		--email=*)
-		EMAIL="${i#*=}"
-		;;
-		--storageaccount=*)
-		STORAGEACCOUNT="${i#*=}"
-		;;	
-		--container=*)
-		CONTAINER="${i#*=}"
-		;;			
-		*)
-		;;
-	esac
+# Parse arguments
+for i in "$@"; do
+  case $i in
+    --hostname=*) HOSTNAME="${i#*=}" ;;
+    --username=*) USERNAME="${i#*=}" ;;
+    --password=*) PASSWORD="${i#*=}" ;;
+    --email=*) EMAIL="${i#*=}" ;;
+    --storageaccount=*) STORAGEACCOUNT="${i#*=}" ;;
+    --container=*) CONTAINER="${i#*=}" ;;
+    *) ;;
+  esac
 done
 
+# Install dependencies
+apt-get update && apt-get upgrade -y
+apt-get install -y software-properties-common curl unzip nfs-common apache2 mariadb-server certbot python3-certbot-apache
 
-#Install Dependencies
-
+# Add PHP 8.2 repo if not already present
+add-apt-repository ppa:ondrej/php -y
 apt-get update
-apt-get upgrade -y
-apt-get install -y  php8.1 php8.1-cli php8.1-common php8.1-imap php8.1-redis php8.1-snmp php8.1-xml php8.1-zip php8.1-mbstring php8.1-curl php8.1-gd php8.1-mysql apache2 mariadb-server certbot nfs-common python3-certbot-apache unzip
+apt-get install -y php8.2 php8.2-{cli,common,imap,redis,snmp,xml,zip,mbstring,curl,gd,mysql}
 
-#Create the database and user
+# Secure MariaDB
+mysql_secure_installation <<EOF
+
+y
+n
+y
+y
+y
+EOF
+
+# Create Nextcloud database and user
 DBPASSWORD=$(openssl rand -base64 14)
-mysql -e "CREATE DATABASE nextcloud;GRANT ALL PRIVILEGES ON nextcloud.* TO 'nextcloud'@'localhost' IDENTIFIED BY '$DBPASSWORD';FLUSH PRIVILEGES;"
+mysql -e "CREATE DATABASE nextcloud;"
+mysql -e "CREATE USER 'nextcloud'@'localhost' IDENTIFIED BY '$DBPASSWORD';"
+mysql -e "GRANT ALL PRIVILEGES ON nextcloud.* TO 'nextcloud'@'localhost';"
+mysql -e "FLUSH PRIVILEGES;"
 
-#Mount the file storage
+# Mount Azure NFS storage
 mkdir -p /mnt/files
-echo "$STORAGEACCOUNT.blob.core.windows.net:/$STORAGEACCOUNT/$CONTAINER  /mnt/files    nfs defaults,sec=sys,vers=3,nolock,proto=tcp,nofail    0 0" >> /etc/fstab 
-mount /mnt/files
+echo "$STORAGEACCOUNT.blob.core.windows.net:/$STORAGEACCOUNT/$CONTAINER /mnt/files nfs defaults,sec=sys,vers=3,nolock,proto=tcp,nofail 0 0" >> /etc/fstab
+mount -a
 
-#Download Nextcloud
+# Download latest Nextcloud
 cd /var/www/html
-wget https://download.nextcloud.com/server/releases/nextcloud-31.0.2.zip
-unzip nextcloud-31.0.2.zip
-chown -R root:root nextcloud
+LATEST_VERSION=$(curl -s https://download.nextcloud.com/server/releases/ | grep -oP 'nextcloud-\K[0-9]+\.[0-9]+\.[0-9]+(?=\.zip)' | sort -V | tail -1)
+curl -O "https://download.nextcloud.com/server/releases/nextcloud-${LATEST_VERSION}.zip"
+unzip "nextcloud-${LATEST_VERSION}.zip"
+rm "nextcloud-${LATEST_VERSION}.zip"
+chown -R www-data:www-data nextcloud
 cd nextcloud
 
-#Install Nextcloud
-php occ  maintenance:install --database "mysql" --database-name "nextcloud"  --database-user "nextcloud" --database-pass "$DBPASSWORD" --admin-user "$USERNAME" --admin-pass "$PASSWORD" --data-dir /mnt/files
-sed -i "s/0 => 'localhost',/0 => '$HOSTNAME',/g" ./config/config.php
-sed -i "s/  'overwrite.cli.url' => 'https:\/\/localhost',/  'overwrite.cli.url' => 'http:\/\/$HOSTNAME',/g" ./config/config.php
+# Install Nextcloud
+sudo -u www-data php occ maintenance:install \
+  --database "mysql" \
+  --database-name "nextcloud" \
+  --database-user "nextcloud" \
+  --database-pass "$DBPASSWORD" \
+  --admin-user "$USERNAME" \
+  --admin-pass "$PASSWORD" \
+  --data-dir /mnt/files
 
-cd ..
-chown -R www-data:www-data nextcloud
-chown -R www-data:www-data /mnt/files
+# Configure trusted domain and URL
+CONFIG_FILE=/var/www/html/nextcloud/config/config.php
+sed -i "s/'localhost'/'$HOSTNAME'/g" "$CONFIG_FILE"
+sed -i "s|'overwrite.cli.url' => '.*'|'overwrite.cli.url' => 'https://$HOSTNAME'|g" "$CONFIG_FILE"
 
-#Configure Apache
-tee -a /etc/apache2/sites-available/nextcloud.conf << EOF
+# Configure Apache
+cat <<EOF > /etc/apache2/sites-available/nextcloud.conf
 <VirtualHost *:80>
-ServerName $HOSTNAME
-DocumentRoot /var/www/html/nextcloud
+    ServerName $HOSTNAME
+    DocumentRoot /var/www/html/nextcloud
 
-<Directory /var/www/html/nextcloud/>
- Require all granted
- Options FollowSymlinks MultiViews
- AllowOverride All
- <IfModule mod_dav.c>
- Dav off
- </IfModule>
-</Directory>
+    <Directory /var/www/html/nextcloud/>
+        Require all granted
+        Options FollowSymlinks MultiViews
+        AllowOverride All
+        <IfModule mod_dav.c>
+            Dav off
+        </IfModule>
+    </Directory>
 
-ErrorLog /var/log/apache2/$HOSTNAME.error_log
-CustomLog /var/log/apache2/$HOSTNAME.access_log common
+    ErrorLog \${APACHE_LOG_DIR}/$HOSTNAME.error.log
+    CustomLog \${APACHE_LOG_DIR}/$HOSTNAME.access.log combined
 </VirtualHost>
 EOF
 
 a2ensite nextcloud.conf
-a2enmod rewrite
+a2enmod rewrite headers env dir mime ssl
 
-#Obtain a Certificate from Let's Encrypt
-certbot run -d $HOSTNAME --agree-tos --apache -m $EMAIL -n
-systemctl restart apache2
+# Obtain Let's Encrypt certificate
+certbot --apache --non-interactive --agree-tos --redirect -d "$HOSTNAME" -m "$EMAIL"
+
+# Restart Apache
+systemctl reload apache2
