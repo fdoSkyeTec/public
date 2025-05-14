@@ -28,7 +28,7 @@ done
 apt-get update && apt-get upgrade -y
 apt-get install -y software-properties-common curl unzip nfs-common apache2 mariadb-server certbot python3-certbot-apache redis-server
 
-# Add PHP 8.2 repo and install
+# Add PHP 8.2 and install extensions
 add-apt-repository ppa:ondrej/php -y
 apt-get update
 apt-get install -y php8.2 php8.2-{cli,common,imap,redis,snmp,xml,zip,mbstring,curl,gd,mysql,apcu,opcache}
@@ -47,44 +47,51 @@ y
 y
 EOF
 
-# Create Nextcloud database and user
+# Create database and user
 DBPASSWORD=$(openssl rand -base64 14)
+mysql -e "DROP DATABASE IF EXISTS nextcloud;"
+mysql -e "DROP USER IF EXISTS 'nextcloud'@'localhost';"
 mysql -e "CREATE DATABASE nextcloud;"
 mysql -e "CREATE USER 'nextcloud'@'localhost' IDENTIFIED BY '$DBPASSWORD';"
 mysql -e "GRANT ALL PRIVILEGES ON nextcloud.* TO 'nextcloud'@'localhost';"
 mysql -e "FLUSH PRIVILEGES;"
 
-# Mount Azure NFS storage
+# Mount NFS storage
 mkdir -p /mnt/files
-echo "$STORAGEACCOUNT.blob.core.windows.net:/$STORAGEACCOUNT/$CONTAINER /mnt/files nfs defaults,sec=sys,vers=3,nolock,proto=tcp,nofail 0 0" >> /etc/fstab
+if ! grep -q "/mnt/files" /etc/fstab; then
+  echo "$STORAGEACCOUNT.blob.core.windows.net:/$STORAGEACCOUNT/$CONTAINER /mnt/files nfs defaults,sec=sys,vers=3,nolock,proto=tcp,nofail 0 0" >> /etc/fstab
+fi
 mount -a
 
 # Download latest Nextcloud
 cd /var/www/html
 LATEST_VERSION=$(curl -s https://download.nextcloud.com/server/releases/ | grep -oP 'nextcloud-\K[0-9]+\.[0-9]+\.[0-9]+(?=\.zip)' | sort -V | tail -1)
 curl -O "https://download.nextcloud.com/server/releases/nextcloud-${LATEST_VERSION}.zip"
-unzip "nextcloud-${LATEST_VERSION}.zip"
-rm "nextcloud-${LATEST_VERSION}.zip"
-chown -R www-data:www-data nextcloud
-cd nextcloud
 
-# Install Nextcloud
-sudo -u www-data php occ maintenance:install \
-  --database "mysql" \
-  --database-name "nextcloud" \
-  --database-user "nextcloud" \
-  --database-pass "$DBPASSWORD" \
-  --admin-user "$USERNAME" \
-  --admin-pass "$PASSWORD" \
-  --data-dir /mnt/files
+# Clean up and extract
+rm -rf /var/www/html/nextcloud
+unzip "nextcloud-${LATEST_VERSION}.zip" -d /var/www/html/
+chown -R www-data:www-data /var/www/html/nextcloud
 
-# Configure config.php
-CONFIG_FILE=/var/www/html/nextcloud/config/config.php
+# Install Nextcloud if not already installed
+if [ ! -f /var/www/html/nextcloud/config/config.php ]; then
+  sudo -u www-data php /var/www/html/nextcloud/occ maintenance:install \
+    --database "mysql" \
+    --database-name "nextcloud" \
+    --database-user "nextcloud" \
+    --database-pass "$DBPASSWORD" \
+    --admin-user "$USERNAME" \
+    --admin-pass "$PASSWORD" \
+    --data-dir /mnt/files
+fi
+
+# Configure Nextcloud config.php
+CONFIG_FILE="/var/www/html/nextcloud/config/config.php"
 sed -i "s/'localhost'/'$HOSTNAME'/g" "$CONFIG_FILE"
 sed -i "s|'overwrite.cli.url' => '.*'|'overwrite.cli.url' => 'https://$HOSTNAME'|g" "$CONFIG_FILE"
 
-# Add Redis and caching configuration
-cat <<EOF >> "$CONFIG_FILE"
+# Append caching settings
+grep -q "memcache.local" "$CONFIG_FILE" || cat <<EOF >> "$CONFIG_FILE"
   'memcache.local' => '\\OC\\Memcache\\APCu',
   'memcache.locking' => '\\OC\\Memcache\\Redis',
   'redis' => [
@@ -93,7 +100,7 @@ cat <<EOF >> "$CONFIG_FILE"
   ],
 EOF
 
-# Configure Apache
+# Apache site configuration
 cat <<EOF > /etc/apache2/sites-available/nextcloud.conf
 <VirtualHost *:80>
     ServerName $HOSTNAME
@@ -116,7 +123,7 @@ EOF
 a2ensite nextcloud.conf
 a2enmod rewrite headers env dir mime ssl
 
-# Enable OPCache with recommended settings
+# Enable and configure OPcache
 cat <<EOF > /etc/php/8.2/apache2/conf.d/10-opcache.ini
 [opcache]
 opcache.enable=1
@@ -127,16 +134,16 @@ opcache.save_comments=1
 opcache.revalidate_freq=1
 EOF
 
-# Enable APCu
+# Enable APCu for CLI
 echo "apc.enable_cli=1" > /etc/php/8.2/mods-available/apcu.ini
 
-# Tune PHP (optional: tweak based on RAM)
+# PHP tuning
 sed -i 's/memory_limit = .*/memory_limit = 512M/' /etc/php/8.2/apache2/php.ini
 sed -i 's/upload_max_filesize = .*/upload_max_filesize = 512M/' /etc/php/8.2/apache2/php.ini
 sed -i 's/post_max_size = .*/post_max_size = 512M/' /etc/php/8.2/apache2/php.ini
 sed -i 's/max_execution_time = .*/max_execution_time = 300/' /etc/php/8.2/apache2/php.ini
 
-# Obtain SSL certificate
+# Enable HTTPS with Let's Encrypt
 certbot --apache --non-interactive --agree-tos --redirect -d "$HOSTNAME" -m "$EMAIL"
 
 # Restart services
